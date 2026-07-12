@@ -197,9 +197,7 @@ jobs:
     # 403s GitHub-hosted runner IPs, so the nightly vLLM wheel must be fetched
     # here. Build needs only network + pip (no GPU); it shares the box with
     # qualify, which runs after via `needs`.
-    runs-on:
-      group: dev_lab
-      labels: [self-hosted, Linux]
+    runs-on: ubuntu-22.04
     needs: [prepare-matrix, detect-nightly]
     # Skip the whole build (and everything downstream — qualify/create-release
     # cascade off a skipped build) when this build has already been qualified.
@@ -232,6 +230,9 @@ jobs:
       omni_version: ${{ steps.set-outputs.outputs.omni_version }}
 
     steps:
+    - name: Free disk space (fork validation runner)
+      run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+
     - name: Checkout repository
       uses: actions/checkout@v4
 
