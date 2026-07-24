@@ -32,8 +32,22 @@ supply_chain: >
   THIRD-PARTY community bundles from a personal account (ianbmacdonald), NOT
   lemonade-official. Assembled from AMD's official dcgpu wheel indices. Verify every
   sha256 below before use; do not proceed on a mismatch.
-invalidated_by: any release whose tag matches 'vllm.*-gfx94.*|vllm.*-gfx950.*' appearing in
-  https://api.github.com/repos/lemonade-sdk/vllm-rocm/releases
+serves_via: >
+  STANDALONE vLLM only (its own OpenAI API, default :8000). NOT through lemonade (:13305):
+  lemonade's vLLM backend is hardwired to the official repo two ways — the download source
+  is hardcoded (vllm_server.cpp: params.repo="lemonade-sdk/vllm-rocm"; the vllm.rocm_bin pin
+  changes only the tag, never the repo) AND the backend descriptor omits gfx942/gfx950 from
+  its GPU allow-list (vllm.h, "omitted until ... assets ship"). Sideloading + running vLLM
+  standalone bypasses both. This bundle keeps working standalone regardless of anything below.
+invalidated_by:
+  # BOTH must hold before lemonade-through-:13305 serves vLLM on CDNA. The asset alone does
+  # NOT flip it — the descriptor gate is a SEPARATE lemonade source change shipped in a release.
+  official_asset: a release tag matching 'vllm.*-gfx94.*|vllm.*-gfx950.*' in
+    https://api.github.com/repos/lemonade-sdk/vllm-rocm/releases   (clears the hardcoded-repo lock)
+  AND_lemonade_release: a lemonade version whose vLLM descriptor re-adds gfx942/gfx950 to the
+    vllm.h support list (clears the allow-list gate) — gated at a LEMONADE RELEASE, no sooner
+  note: the community sideload (this bundle, standalone) is unaffected by either and stays valid;
+    the two conditions above only govern when lemond (:13305) will serve vLLM NATIVELY on CDNA
 verify_sha256: required   # agents: refuse to install on mismatch; do not skip
 bundles:
   gfx942:
@@ -74,9 +88,12 @@ self_heal:
                                         # hybrid install harder to debug than either state
   do_not: fake or hand-edit version.txt to a future tag — that suppresses the official
     update forever
-  after_official_ships: upgrade lemonade -> verify the backend update installed the
-    official asset -> confirm `vllm.rocm_bin` is unset -> community dir contents are
-    already replaced (same-dir swap); nothing else to clean
+  after_official_ships: applies only once BOTH invalidated_by conditions hold — the asset is
+    published AND you have upgraded to a lemonade release that re-added the CDNA descriptor
+    (the asset alone changes nothing for the :13305 path). Then: upgrade lemonade -> verify the
+    backend update installed the official asset -> confirm `vllm.rocm_bin` is unset -> community
+    dir contents are already replaced (same-dir swap); nothing else to clean. Until that lemonade
+    release exists, stay on the standalone bundle.
 ```
 
 ## Re-verify our claims yourself (agents especially)
