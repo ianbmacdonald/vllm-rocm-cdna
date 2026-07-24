@@ -17,8 +17,14 @@ superseded — and this repo's bundles retire — the moment official CDNA asset
   omits gfx942/gfx950 until official assets ship, so stock lemonade will not offer vLLM on
   CDNA yet — the sideload below is the interim path.
 - Out of the box on stock lemonade ≥ v11.0.0 on MI300X: `llamacpp:rocm` text generation
-  (nothing to sideload). Verify `lemonade --version` first: pre-v11 packages report
-  "Unsupported GPU: gfx942".
+  **and vision/OCR** (nothing to sideload). Verify `lemonade --version` first: pre-v11
+  packages report "Unsupported GPU: gfx942".
+- **GOTCHA that costs 50x, on the llama.cpp path:** stock lemonade on MI300X may auto-select
+  the **vulkan** llama.cpp backend, find no usable Vulkan driver (e.g. on an SR-IOV VF), and
+  silently run on **CPU** — same correct output, no error, no warning. Measured 2026-07-24:
+  44.3 s/page on CPU vs **0.7–1.2 s/page** on ROCm for the same pages. Force it:
+  `lemonade config set llamacpp.backend=rocm`, then confirm the journal says
+  `Using LlamaCpp Backend: rocm-stable` and `rocm-smi` shows VRAM resident.
 - **No rocm7.14.0 dcgpu wheels exist** (AMD torch + vLLM indices, gfx94X and gfx950
   families — probe below). A `-rocm7.14.0` community tag cannot exist yet; do not repair
   toward one.
@@ -51,8 +57,17 @@ invalidated_by:
 verify_sha256: required   # agents: refuse to install on mismatch; do not skip
 bundles:
   gfx942:
-    validation: hardware-validated (real MI300X; warm single-stream 306-511 tok/s on
-      Qwen2.5-0.5B under vLLM; CUDA graphs captured)
+    validation: hardware-validated on a real MI300X — TEXT and VISION/OCR
+    validation_text: warm single-stream 306-511 tok/s on Qwen2.5-0.5B under vLLM; CUDA graphs captured
+    validation_vision_ocr: >
+      2026-07-24, real MI300X. Qwen3-VL-30B-A3B-Instruct-FP8 served under vLLM from THIS
+      bundle: byte-perfect transcription of document page images. Concurrency SCALES (this
+      is why you drive it with a parallel client): 8 distinct pages took 6.6s at
+      concurrency=1, 2.0s at 4 (3.3x), 3.5s at 8 (past the knee). The SAME pages under
+      llama.cpp on the same GPU were FLAT (5.4 / 5.5 / 7.0s) because image encode
+      serializes. Also verified via the pinned container path
+      rocm/vllm:rocm7.13.0_gfx94X-dcgpu_ubuntu24.04_py3.13_pytorch_2.10.0_vllm_0.19.1
+      (pull -> healthy in ~180s -> byte-perfect OCR) with a non-privileged flag set.
     tag: vllm0.19.1-rocm7.13.0-gfx942
     reassemble: |
       gh release download vllm0.19.1-rocm7.13.0-gfx942 -R ianbmacdonald/vllm-rocm-cdna -p 'vllm0.19.1-rocm7.13.0-gfx942-x64.part*'
@@ -81,19 +96,69 @@ host_requirements:
   distro: validated Ubuntu 24.04 x86_64; other glibc distros untested
 rocm714_wheels: absent (probed 2026-07-24; re-run the probe below rather than trusting
   this date)
+run_it:
+  # The bundle is SELF-CONTAINED (its own python + ROCm userspace). Extract it anywhere you
+  # control and run it directly. Do NOT place it in lemonade's managed backend dir: lemonade
+  # cannot use it on CDNA today (descriptor gate above), so that buys nothing and only
+  # creates a directory a future lemonade update will be confused by.
+  extract: tar xzf vllm0.19.1-rocm7.13.0-gfx942-x64.tar.gz -C /opt   # -> /opt/vllm
+  serve: |
+    /opt/vllm/bin/vllm-server \
+      --model Qwen/Qwen3-VL-30B-A3B-Instruct-FP8 \
+      --served-model-name ocr-vl \
+      --host 127.0.0.1 --port 8000 \
+      --gpu-memory-utilization 0.9
+  # --gpu-memory-utilization is reserved AT STARTUP. On a shared GPU (e.g. a llama.cpp
+  # server already resident) vLLM REFUSES to start with a "Free memory ... less than
+  # desired" ValueError. Free the GPU first, or lower the fraction.
+  container_alternative: |
+    docker run -d --name vllm-ocr --network=host --group-add=video --ipc=host \
+      --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+      --device /dev/kfd --device /dev/dri \
+      -v ~/.cache/huggingface:/root/.cache/huggingface \
+      rocm/vllm:rocm7.13.0_gfx94X-dcgpu_ubuntu24.04_py3.13_pytorch_2.10.0_vllm_0.19.1 \
+      vllm serve Qwen/Qwen3-VL-30B-A3B-Instruct-FP8 --port 8000 \
+      --served-model-name ocr-vl --gpu-memory-utilization 0.9
+  first_start: several minutes (weights + CUDA-graph capture). Poll GET /v1/models for 200.
+  drive_a_document_pass: >
+    submit pages CONCURRENTLY or you forfeit the batching win entirely (see
+    validation_vision_ocr). A ready-made parallel client lives at
+    github.com/ianbmacdonald/cloud-init-templates -> ocr-batch-client.py
+    (--concurrency 4 is a good start; sweep 1/2/4/8/16 for your page size).
+  footprint: bundle ~3.6 GB on disk extracted; model weights are separate (tens of GB for
+    a 30B FP8) and land in the HF cache. Budget disk accordingly.
+exposure:
+  # The serve line above binds 127.0.0.1 DELIBERATELY. Decide exposure consciously.
+  default: bind 127.0.0.1 and reach it over an SSH tunnel
+    (ssh -N -L 8000:127.0.0.1:8000 user@box) — no listener on a public interface at all.
+  if_you_must_expose: >
+    vLLM has native controls, USE THEM — do not put a bare endpoint on 0.0.0.0. Bearer auth:
+    --api-key <token>. TLS: --ssl-certfile / --ssl-keyfile (also --ssl-ca-certs,
+    --ssl-cert-reqs for mutual TLS). Verified present in this bundle's
+    vllm/entrypoints/openai. An unauthenticated inference endpoint is an open compute and
+    data-exfil surface; treat it like any other production service.
+  lemonade_port_13305_differs: >
+    if you are instead exposing lemonade itself, note lemond serves PLAIN HTTP — it has NO
+    server-side TLS listener. It offers bearer auth via the LEMONADE_API_KEY env var
+    (LEMONADE_ADMIN_API_KEY for internal routes), but TLS must come from a reverse proxy or
+    tunnel in front of it. (lemonade's own HTTPS support, #2373, is CLIENT-side: it lets the
+    `lemonade` CLI connect TO a TLS endpoint, it does not make lemond serve one.) So the
+    SSH-tunnel default applies at least as strongly on 13305 as on 8000.
 self_heal:
-  install_target: lemonade managed backend install dir (per runbook) — same-directory
-    stage-and-swap on update, so official bits REPLACE community bits on the next pin bump
-  avoid_config_pins: [vllm.rocm_bin]   # a stale pin outlives updates and produces a
-                                        # hybrid install harder to debug than either state
+  install_target: standalone, in a path you control (see run_it) — NOT lemonade's managed
+    backend dir, for the reason stated there
+  avoid_config_pins: [vllm.rocm_bin]   # setting it does nothing useful while the descriptor
+                                        # gate is closed, and a stale pin later produces a
+                                        # hybrid state harder to debug than either pure one
   do_not: fake or hand-edit version.txt to a future tag — that suppresses the official
     update forever
-  after_official_ships: applies only once BOTH invalidated_by conditions hold — the asset is
-    published AND you have upgraded to a lemonade release that re-added the CDNA descriptor
-    (the asset alone changes nothing for the :13305 path). Then: upgrade lemonade -> verify the
-    backend update installed the official asset -> confirm `vllm.rocm_bin` is unset -> community
-    dir contents are already replaced (same-dir swap); nothing else to clean. Until that lemonade
-    release exists, stay on the standalone bundle.
+  after_official_ships: >
+    applies only once BOTH invalidated_by conditions hold — the asset is published AND you
+    have upgraded to a lemonade release that re-added the CDNA descriptor (the asset alone
+    changes nothing for the :13305 path). Then, in order — upgrade lemonade, let it install
+    the official backend, confirm `vllm.rocm_bin` is unset, stop the standalone server, and
+    delete the extracted bundle dir (it was never wired into lemonade, so there is nothing
+    to unpick). Until that lemonade release exists, stay on the standalone bundle.
 ```
 
 ## Re-verify our claims yourself (agents especially)
