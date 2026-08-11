@@ -37,6 +37,7 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       stable_ok: ${{ steps.probe.outputs.stable_ok }}
+      fetch_ok: ${{ steps.probe.outputs.fetch_ok }}
       nightly_ok: ${{ steps.probe.outputs.nightly_ok }}
       therock_ok: ${{ steps.probe.outputs.therock_ok }}
     steps:
@@ -64,9 +65,34 @@ jobs:
           probe "therock-gfx94X" "https://rocm.nightlies.amd.com/v2/gfx94X-dcgpu/torch/"             || rc_therock=1
           echo "::endgroup::"
 
+          # A DIRECTORY LISTING IS NOT A DOWNLOAD. The inherited claim is that AMD 403s
+          # GitHub-hosted runner IPs; the listings above returned 200, but an index can be
+          # open while the artifact fetch is gated. Ranged-GET a real wheel so the answer is
+          # about the thing the build actually does.
+          echo "::group::Actual wheel fetch (ranged GET, a few KB, not a full download)"
+          rc_fetch=0
+          WHL=$(curl -sS --max-time 30 "https://rocm.frameworks.amd.com/whl/gfx94X-dcgpu/vllm/" \
+                | grep -oE 'href="[^"]*\.whl"' | head -1 | sed 's/href="//;s/"$//')
+          if [ -n "$WHL" ]; then
+            case "$WHL" in
+              http*) WURL="$WHL" ;;
+              /*)    WURL="https://rocm.frameworks.amd.com$WHL" ;;
+              *)     WURL="https://rocm.frameworks.amd.com/whl/gfx94X-dcgpu/vllm/$WHL" ;;
+            esac
+            FCODE=$(curl -sS -r 0-2047 -o /tmp/probe.part -w '%{http_code}' --max-time 60 "$WURL") || FCODE="curl-failed"
+            FBYTES=$(stat -c%s /tmp/probe.part 2>/dev/null || echo 0)
+            echo "wheel fetch: HTTP $FCODE, $FBYTES bytes from ${WURL##*/}"
+            case "$FCODE" in 200|206) : ;; *) rc_fetch=1 ;; esac
+          else
+            echo "wheel fetch: could not parse a .whl href out of the index listing"
+            rc_fetch=1
+          fi
+          echo "::endgroup::"
+
           echo "stable_ok=$([ $rc_stable -eq 0 ] && echo true || echo false)"   >> "$GITHUB_OUTPUT"
           echo "nightly_ok=$([ $rc_nightly -eq 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           echo "therock_ok=$([ $rc_therock -eq 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "fetch_ok=$([ $rc_fetch -eq 0 ] && echo true || echo false)"     >> "$GITHUB_OUTPUT"
 
           {
             echo "### 1. AMD index reachability (GitHub-hosted runner)"
@@ -76,8 +102,9 @@ jobs:
             echo "| stable dcgpu   | $([ $rc_stable  -eq 0 ] && echo 'yes' || echo 'NO — 403 or unreachable') |"
             echo "| nightly CDNA   | $([ $rc_nightly -eq 0 ] && echo 'yes' || echo 'NO — 403 or unreachable') |"
             echo "| TheRock nightly| $([ $rc_therock -eq 0 ] && echo 'yes' || echo 'NO — 403 or unreachable') |"
+            echo "| **actual wheel fetch** | $([ $rc_fetch -eq 0 ] && echo '**yes**' || echo '**NO — the listing lied**') |"
             echo ""
-            if [ $rc_nightly -ne 0 ] || [ $rc_therock -ne 0 ]; then
+            if [ $rc_nightly -ne 0 ] || [ $rc_therock -ne 0 ] || [ $rc_fetch -ne 0 ]; then
               echo "**Consequence:** the build CANNOT move off the rented GPU box for that channel."
               echo "Box lifetime and the cost model both grow. Re-plan before the first paid run."
             else
