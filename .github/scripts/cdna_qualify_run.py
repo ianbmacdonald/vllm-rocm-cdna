@@ -41,6 +41,19 @@ MAX_RATE = float(os.environ.get("CDNA_MAX_RATE_USD", "5.00"))
 BOOT_WAIT_S = int(os.environ.get("CDNA_BOOT_WAIT_SECONDS", "900"))
 DRY_RUN = os.environ.get("CDNA_DRY_RUN", "") not in ("", "0", "false")
 
+# GPU-SHAPE POLICY. The qualification needs ONE card, but capacity is whatever the provider
+# happens to be offering, and price scales with GPU count. Combined with the 60-minute minimum
+# reservation, taking a 2x box when a 1x would do doubles the FLOOR cost of every run.
+#   CDNA_MAX_GPUS            preferred ceiling on GPU count (default 1)
+#   CDNA_WAIT_MINUTES        how long to poll for a conforming offer before giving up (default 0)
+#   CDNA_ACCEPT_LARGER       if the wait expires, take a bigger box anyway (default off)
+# The three together express "just wait for a 1x", "take whatever is there", or a bounded
+# compromise, without anyone editing the script.
+MAX_GPUS = int(os.environ.get("CDNA_MAX_GPUS", "1"))
+WAIT_MINUTES = float(os.environ.get("CDNA_WAIT_MINUTES", "0"))
+ACCEPT_LARGER = os.environ.get("CDNA_ACCEPT_LARGER", "") not in ("", "0", "false")
+POLL_SECONDS = int(os.environ.get("CDNA_POLL_SECONDS", "60"))
+
 # The dead man's switch is passed as `user_data_url` — a URL the provider FETCHES — not as
 # inline user-data. This distinction is load-bearing: the API SILENTLY DROPS unknown fields,
 # so a body carrying `user_data` (or the older `cloud_init_url`) is accepted, has no effect,
@@ -149,11 +162,43 @@ def main() -> int:
             "A second box would risk the tenant cap and muddy the cost delta.")
         return 1
 
-    offers = client.list_available_vms()
-    if not offers:
-        log("no capacity offered right now — nothing to rent, exiting without spending")
-        summary("### Paid run skipped\n\nNo capacity was offered by the provider. $0 spent.")
+    def gpu_count(o):
+        return sum(g.get("count", 0) for g in o.get("Specs", {}).get("gpus", []))
+
+    def poll_for_offer():
+        """Wait, bounded, for an offer at or under MAX_GPUS. Polling costs nothing: capacity is
+        free to look at and only provisioning bills. Returns (offer, waited_seconds, settled)."""
+        t0 = time.monotonic()
+        deadline = t0 + WAIT_MINUTES * 60
+        while True:
+            offs = client.list_available_vms()
+            fitting = [o for o in offs if gpu_count(o) and gpu_count(o) <= MAX_GPUS]
+            if fitting:
+                return sorted(fitting, key=gpu_count)[0], time.monotonic() - t0, True
+            if time.monotonic() >= deadline:
+                shapes = sorted({gpu_count(o) for o in offs}) if offs else []
+                log(f"waited {(time.monotonic()-t0)/60:.1f} min; no offer at <= {MAX_GPUS} GPU"
+                    f"(s). Shapes on offer: {shapes or 'none'}")
+                if ACCEPT_LARGER and offs:
+                    bigger = sorted(offs, key=gpu_count)[0]
+                    log(f"CDNA_ACCEPT_LARGER is set — taking a {gpu_count(bigger)}x box instead")
+                    return bigger, time.monotonic() - t0, False
+                return None, time.monotonic() - t0, False
+            log(f"no offer at <= {MAX_GPUS} GPU(s) yet; re-checking in {POLL_SECONDS}s "
+                f"({(deadline - time.monotonic())/60:.1f} min of wait left)")
+            time.sleep(POLL_SECONDS)
+
+    offer, waited_s, exact = poll_for_offer()
+    if offer is None:
+        log("no acceptable capacity — exiting without spending")
+        summary(f"### Paid run skipped\n\nNo offer at or under {MAX_GPUS} GPU(s) after "
+                f"{waited_s/60:.1f} min of waiting. **$0 spent.** Set `CDNA_ACCEPT_LARGER=1` "
+                f"to take a bigger box, or raise `CDNA_WAIT_MINUTES`.")
         return 0
+    if not exact:
+        log("NOTE: this box is larger than needed, so the floor cost per run is higher than "
+            "the 1x case. Recorded so the cost table is not read as the 1x number.")
+    offers = [offer]
 
     # Take the offer EXACTLY as given. Provisioning a shape the provider did not offer is
     # the documented over-allocation class.
@@ -161,14 +206,9 @@ def main() -> int:
     #   {Quantity, OnDemandPrice (CENTS), MinimumReservationMinutes, Specs{gpus:[{count,model}]}}
     # An earlier version read `hourly_rate`/`price`, which are absent, so the rate parsed as
     # 0.00 and the spend cap could never fire. A guard that reads zero is not a guard.
-    def pick(offs):
-        """Prefer the FEWEST GPUs on offer: this run needs one card, and the price scales."""
-        return sorted(offs, key=lambda o: sum(g.get("count", 0)
-                      for g in o.get("Specs", {}).get("gpus", [])) or 99)[0]
-
-    offer = pick(offers)
+    offer = offers[0]
     rate = float(offer.get("OnDemandPrice", 0) or 0) / 100.0
-    gpu_n = sum(g.get("count", 0) for g in offer.get("Specs", {}).get("gpus", []))
+    gpu_n = gpu_count(offer)
     min_minutes = int(offer.get("MinimumReservationMinutes", 0) or 0)
     floor_cost = rate * (min_minutes / 60.0) if min_minutes else 0.0
 
@@ -231,6 +271,8 @@ def main() -> int:
     summary("### CDNA CI — first paid run, measured\n")
     summary(f"- wall clock: **{elapsed/60:.1f} min**")
     summary(f"- offered shape: **{gpu_n}x GPU at ${rate:.2f}/hr**, minimum reservation **{min_minutes} min**")
+    summary(f"- shape policy: max {MAX_GPUS} GPU(s), waited **{waited_s/60:.1f} min**, "
+            f"got {'the requested shape' if exact else 'a LARGER box (cost is not the 1x figure)'}")
     summary(f"- floor cost imposed by the minimum reservation: **${floor_cost:.2f}**")
     summary(f"- **measured cost (balance delta): ${delta:.2f}**")
     summary(f"- implied effective rate: **${(delta/(elapsed/3600)) if elapsed > 0 else 0:.2f}/hr**")
