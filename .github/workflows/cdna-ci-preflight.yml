@@ -1,0 +1,130 @@
+name: CDNA CI preflight ($0)
+
+# RUN 0 of the CDNA CI proving plan. Spends NOTHING and provisions NOTHING.
+#
+# It exists because the first version of this design could spend money and THEN discover it
+# could not publish. Every free check now runs before the first dollar. It also settles the
+# gating unknowns that decide the architecture:
+#
+#   1. Can a GitHub-hosted runner reach AMD's wheel indices? The upstream workflow puts its
+#      build on a self-hosted box because AMD "403s GitHub-hosted runner IPs". If that is true
+#      for the channel we need, the build cannot move off the rented GPU box and the whole cost
+#      model changes. This job MEASURES it rather than inheriting the claim.
+#   2. Does the provider API expose tagging, auto-terminate and a server-side budget cap? Three
+#      safety rails depend on those existing. Probed read-only.
+#   3. Does the no-secret skip path actually work? It is the first thing that runs in an adopting
+#      repo, and it had never been exercised.
+#
+# Nothing here needs a GPU, a rented box, or a paid API call.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * 1'   # weekly, ahead of any paid run
+
+permissions:
+  contents: read
+
+jobs:
+  egress:
+    name: "1. AMD index reachability from a GitHub-hosted runner"
+    runs-on: ubuntu-22.04
+    outputs:
+      stable_ok: ${{ steps.probe.outputs.stable_ok }}
+      nightly_ok: ${{ steps.probe.outputs.nightly_ok }}
+      therock_ok: ${{ steps.probe.outputs.therock_ok }}
+    steps:
+      - id: probe
+        name: Probe each index and report the HTTP status
+        run: |
+          set -uo pipefail
+          # Deliberately NOT `set -e`: a 403 is a RESULT, not a failure of this job.
+          # And deliberately no `2>/dev/null` anywhere — a suppressed error would be
+          # indistinguishable from a clean negative, which is the trap this repo keeps hitting.
+          probe() {
+            local name="$1" url="$2"
+            local code
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$url") || code="curl-failed"
+            printf '%-26s %-6s %s\n' "$name" "$code" "$url"
+            [ "$code" = "200" ] && return 0 || return 1
+          }
+
+          echo "::group::AMD wheel index reachability from $(curl -sS --max-time 20 https://api.ipify.org || echo unknown)"
+          rc_stable=0; rc_nightly=0; rc_therock=0
+          probe "stable-gfx94X"  "https://rocm.frameworks.amd.com/whl/gfx94X-dcgpu/vllm/"            || rc_stable=1
+          probe "stable-gfx950"  "https://rocm.frameworks.amd.com/whl/gfx950-dcgpu/vllm/"            || rc_stable=1
+          probe "nightly-cdna"   "https://rocm.frameworks-nightlies.amd.com/whl/device-all-cdna/vllm/" || rc_nightly=1
+          probe "nightly-gfx94X" "https://rocm.frameworks-nightlies.amd.com/whl/gfx94X-dcgpu/vllm/"  || rc_nightly=1
+          probe "therock-gfx94X" "https://rocm.nightlies.amd.com/v2/gfx94X-dcgpu/torch/"             || rc_therock=1
+          echo "::endgroup::"
+
+          echo "stable_ok=$([ $rc_stable -eq 0 ] && echo true || echo false)"   >> "$GITHUB_OUTPUT"
+          echo "nightly_ok=$([ $rc_nightly -eq 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "therock_ok=$([ $rc_therock -eq 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 1. AMD index reachability (GitHub-hosted runner)"
+            echo ""
+            echo "| channel | reachable |"
+            echo "|---|---|"
+            echo "| stable dcgpu   | $([ $rc_stable  -eq 0 ] && echo 'yes' || echo 'NO — 403 or unreachable') |"
+            echo "| nightly CDNA   | $([ $rc_nightly -eq 0 ] && echo 'yes' || echo 'NO — 403 or unreachable') |"
+            echo "| TheRock nightly| $([ $rc_therock -eq 0 ] && echo 'yes' || echo 'NO — 403 or unreachable') |"
+            echo ""
+            if [ $rc_nightly -ne 0 ] || [ $rc_therock -ne 0 ]; then
+              echo "**Consequence:** the build CANNOT move off the rented GPU box for that channel."
+              echo "Box lifetime and the cost model both grow. Re-plan before the first paid run."
+            else
+              echo "**Consequence:** the build can run free on a GitHub-hosted runner; the rented box"
+              echo "is needed only for qualification, which is the design the cost model assumes."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  provider:
+    name: "2. Provider capability probe (read-only, no provisioning)"
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip cleanly when no credential is configured
+        id: gate
+        env:
+          HOTAISLE_API_KEY: ${{ secrets.HOTAISLE_API_KEY }}
+        run: |
+          set -uo pipefail
+          if [ -z "${HOTAISLE_API_KEY:-}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### 2. Provider probe — SKIPPED (no credential)"
+              echo ""
+              echo "\`HOTAISLE_API_KEY\` is not set in this repository, so the CDNA legs no-op."
+              echo "This is the intended state for an adopting repo before it supplies its own"
+              echo "credential, and this run is the test that the skip path works."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Probe capabilities the safety rails depend on
+        if: steps.gate.outputs.configured == 'true'
+        env:
+          HOTAISLE_API_KEY: ${{ secrets.HOTAISLE_API_KEY }}
+        run: python3 .github/scripts/provider_probe.py
+
+  report:
+    name: "3. Preflight verdict"
+    needs: [egress, provider]
+    if: always()
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Gate the paid path on the free checks
+        run: |
+          set -uo pipefail
+          echo "egress   stable=${{ needs.egress.outputs.stable_ok }} nightly=${{ needs.egress.outputs.nightly_ok }} therock=${{ needs.egress.outputs.therock_ok }}"
+          echo "provider job result: ${{ needs.provider.result }}"
+          {
+            echo "### 3. Verdict"
+            echo ""
+            echo "This workflow spent \$0 and provisioned nothing."
+            echo "A paid qualification run should not be authorised until the table above is understood."
+          } >> "$GITHUB_STEP_SUMMARY"
