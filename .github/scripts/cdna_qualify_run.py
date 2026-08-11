@@ -118,6 +118,24 @@ def main() -> int:
         log("no credential — refusing to run blind")
         return 1
 
+    # POSITIVE CONTROL ON THE ONLY RAIL THAT SURVIVES EVERYTHING. The provider FETCHES this
+    # URL; if it 404s the box boots with no kill timer and nothing anywhere reports a problem.
+    # Observed 2026-08-11: raw.githubusercontent.com served 404 for ~18s after the push before
+    # the CDN caught up, which is exactly the window in which a run would arm nothing.
+    import urllib.request
+    try:
+        with urllib.request.urlopen(DEADMAN_URL, timeout=30) as resp:
+            body_txt = resp.read().decode("utf-8", "replace")
+        if resp.status != 200 or "shutdown -h" not in body_txt:
+            log(f"REFUSING TO PROVISION: dead man's switch URL returned {resp.status} or lacks "
+                f"a shutdown directive. Arming nothing would leave a box with no kill timer.")
+            return 1
+        log(f"dead man's switch verified fetchable ({len(body_txt)} bytes, shutdown directive present)")
+    except Exception as exc:                       # noqa: BLE001
+        log(f"REFUSING TO PROVISION: cannot fetch the dead man's switch URL: "
+            f"{type(exc).__name__}: {exc}")
+        return 1
+
     client = Client()
     t_start = time.monotonic()
 
@@ -139,10 +157,28 @@ def main() -> int:
 
     # Take the offer EXACTLY as given. Provisioning a shape the provider did not offer is
     # the documented over-allocation class.
-    offer = offers[0]
-    rate = float(offer.get("hourly_rate", offer.get("price", 0)) or 0) / 100.0
+    # FIELD NAMES ARE MEASURED, NOT GUESSED. The offer payload is
+    #   {Quantity, OnDemandPrice (CENTS), MinimumReservationMinutes, Specs{gpus:[{count,model}]}}
+    # An earlier version read `hourly_rate`/`price`, which are absent, so the rate parsed as
+    # 0.00 and the spend cap could never fire. A guard that reads zero is not a guard.
+    def pick(offs):
+        """Prefer the FEWEST GPUs on offer: this run needs one card, and the price scales."""
+        return sorted(offs, key=lambda o: sum(g.get("count", 0)
+                      for g in o.get("Specs", {}).get("gpus", [])) or 99)[0]
+
+    offer = pick(offers)
+    rate = float(offer.get("OnDemandPrice", 0) or 0) / 100.0
+    gpu_n = sum(g.get("count", 0) for g in offer.get("Specs", {}).get("gpus", []))
+    min_minutes = int(offer.get("MinimumReservationMinutes", 0) or 0)
+    floor_cost = rate * (min_minutes / 60.0) if min_minutes else 0.0
+
+    log(f"best offer: {gpu_n}x GPU at ${rate:.2f}/hr, minimum reservation {min_minutes} min")
+    if min_minutes:
+        log(f"MINIMUM RESERVATION IS BILLED REGARDLESS OF RUN LENGTH -> floor cost "
+            f"${floor_cost:.2f} per run. Shortening the box below {min_minutes} min saves NOTHING.")
     if rate > MAX_RATE:
-        log(f"REFUSING: offered rate ${rate:.2f}/hr exceeds cap ${MAX_RATE:.2f}/hr")
+        log(f"REFUSING: offered rate ${rate:.2f}/hr exceeds cap ${MAX_RATE:.2f}/hr "
+            f"(raise CDNA_MAX_RATE_USD deliberately if this is intended)")
         return 1
 
     body = dict(offer)
@@ -194,7 +230,8 @@ def main() -> int:
 
     summary("### CDNA CI — first paid run, measured\n")
     summary(f"- wall clock: **{elapsed/60:.1f} min**")
-    summary(f"- offered rate: **${rate:.2f}/hr**")
+    summary(f"- offered shape: **{gpu_n}x GPU at ${rate:.2f}/hr**, minimum reservation **{min_minutes} min**")
+    summary(f"- floor cost imposed by the minimum reservation: **${floor_cost:.2f}**")
     summary(f"- **measured cost (balance delta): ${delta:.2f}**")
     summary(f"- implied effective rate: **${(delta/(elapsed/3600)) if elapsed > 0 else 0:.2f}/hr**")
     summary(f"- boot/workload: {workload['detail']}")
