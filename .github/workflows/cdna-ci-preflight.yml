@@ -19,6 +19,12 @@ name: CDNA CI preflight ($0)
 
 on:
   workflow_dispatch:
+  # Branch-scoped push trigger so the MVP can be exercised BEFORE this file reaches the
+  # default branch. workflow_dispatch only resolves against the default branch, and
+  # diverging our fork's main for an unproven workflow is a cost we do not need yet.
+  # Remove this trigger once the workflow lands on main.
+  push:
+    branches: [feat/cdna-ci-preflight]
   schedule:
     - cron: '17 6 * * 1'   # weekly, ahead of any paid run
 
