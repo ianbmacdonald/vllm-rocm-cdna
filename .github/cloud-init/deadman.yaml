@@ -1,0 +1,12 @@
+#cloud-config
+# Dead man's switch for the CDNA CI qualification box.
+#
+# The provider exposes no auto-terminate and no server-side budget cap (probed 2026-08-11),
+# so this in-guest timer is the ONLY control that survives the orchestrator dying, the CI job
+# being cancelled, or the controlling process being killed. It contains no secrets by design:
+# it is fetched over plain HTTPS by the provider at provision time via `user_data_url`.
+#
+# 45 minutes is deliberately longer than the expected qualification run and far shorter than
+# the cost of a leak going unnoticed.
+runcmd:
+  - [ sh, -c, "shutdown -h +45 'cdna-ci dead man switch'" ]
