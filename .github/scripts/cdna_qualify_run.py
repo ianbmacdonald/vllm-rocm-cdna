@@ -234,10 +234,38 @@ def main() -> int:
                 "No VM provisioned, $0 spent.")
         return 0
 
-    vm = client.provision_raw(body)
+    # WRITE THE INTENT BEFORE THE CALL, NOT AFTER IT. Measured 20260811: the provision POST
+    # TIMED OUT client-side and SUCCEEDED server-side. The exception propagated out of
+    # provision_raw before write_state() ran, so a real billing VM existed with NO receipt --
+    # an orphan recoverable only by querying the provider. A timeout is INDISTINGUISHABLE from
+    # a failure, and the box may exist either way, so the record has to predate the risk.
+    write_state(intent="provision", intent_at=time.time(), start_balance=start_balance,
+                deadman_url=DEADMAN_URL, vm_id=None,
+                note="if vm_id is null and this file exists, a provision was ATTEMPTED: "
+                     "query the provider API for orphans before assuming nothing was created")
+    try:
+        vm = client.provision_raw(body)
+    except Exception as exc:                       # noqa: BLE001
+        # Do NOT re-raise blind. The request may have succeeded; reconcile against the API.
+        log(f"provision call FAILED CLIENT-SIDE: {type(exc).__name__}: {exc}")
+        log("the request may still have SUCCEEDED server-side — reconciling against the API")
+        write_state(provision_error=f"{type(exc).__name__}: {exc}")
+        time.sleep(15)
+        try:
+            candidates = client.list_vms()
+        except Exception as exc2:                  # noqa: BLE001
+            log(f"RECONCILE FAILED TOO ({type(exc2).__name__}: {exc2}). A VM MAY BE BILLING "
+                f"AND UNTRACKED. Check the provider API by hand before doing anything else.")
+            return 3
+        if not candidates:
+            log("reconciled: no VM exists, nothing was created, nothing is billing")
+            return 1
+        vm = candidates[0]
+        log(f"reconciled: the provision DID succeed — adopting orphan {vm.get('vm_id')}")
+        write_state(recovered_from_timeout=True)
+
     vm_id = vm.get("vm_id")
-    write_state(vm_id=vm_id, provisioned_at=time.time(), start_balance=start_balance,
-                deadman_minutes=DEADMAN_MIN)
+    write_state(vm_id=vm_id, provisioned_at=time.time(), deadman_minutes=DEADMAN_MIN)
     log(f"provisioned vm_id={vm_id} (state file: {STATE_FILE})")
 
     workload = {"ran": False, "detail": "not attempted"}
