@@ -989,9 +989,8 @@ jobs:
   # branch so the external dashboard can poll it. Runs on a hosted runner (the
   # GPU box has no gh/git tooling). Contract: docs/qualification-feed.md.
   publish-qualification:
-    if: ${{ false }}  # REHEARSAL BRANCH - no data-branch writes
     needs: qualify
-    if: always() && (needs.qualify.result == 'success' || needs.qualify.result == 'failure')
+    if: false && always() && (needs.qualify.result == 'success' || needs.qualify.result == 'failure')
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -1088,7 +1087,6 @@ jobs:
         echo "  https://raw.githubusercontent.com/${{ github.repository }}/${BRANCH}/qualification/index.json"
 
   create-release:
-    if: ${{ false }}  # REHEARSAL BRANCH - never mint a release
     needs: [prepare-matrix, build-ubuntu, qualify]
     runs-on: ubuntu-22.04
     permissions:
@@ -1098,7 +1096,7 @@ jobs:
       matrix: ${{fromJson(needs.prepare-matrix.outputs.ubuntu_matrix)}}
       fail-fast: false
     if: |
-      always() &&
+      false && always() &&
       needs.build-ubuntu.result == 'success' &&
       (needs.qualify.result == 'success' || needs.qualify.result == 'skipped') &&
       github.event_name != 'pull_request' &&
