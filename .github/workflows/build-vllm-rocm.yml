@@ -198,7 +198,7 @@ jobs:
         # exactly as before (qualify skips them -> release ungated, unchanged).
         # Adding a runner for a new target (e.g. a CDNA box for gfx942) is a
         # one-line addition to this map.
-        QUALIFIED_RUNNERS='{"gfx1151":"dev_lab"}'
+        QUALIFIED_RUNNERS='{"gfx942":"cdna-rehearsal"}'
         qualify_matrix=$(echo "$targets" \
           | tr ',' '\n' \
           | sed 's/^ *//;s/ *$//' \
@@ -226,9 +226,7 @@ jobs:
     # 403s GitHub-hosted runner IPs, so the nightly vLLM wheel must be fetched
     # here. Build needs only network + pip (no GPU); it shares the box with
     # qualify, which runs after via `needs`.
-    runs-on:
-      group: dev_lab
-      labels: [self-hosted, Linux]
+    runs-on: [self-hosted, Linux, cdna-rehearsal]
     needs: [prepare-matrix, detect-nightly]
     # Skip the whole build (and everything downstream — qualify/create-release
     # cascade off a skipped build) when this build has already been qualified.
@@ -805,9 +803,7 @@ jobs:
     strategy:
       matrix: ${{ fromJson(needs.prepare-matrix.outputs.qualify_matrix) }}
       fail-fast: false
-    runs-on:
-      group: ${{ matrix.runner_group }}
-      labels: [self-hosted, Linux]
+    runs-on: [self-hosted, Linux, cdna-rehearsal]
     env:
       GFX: ${{ matrix.gfx }}
     # Runs on release builds AND on omni dispatches (omni is experimental —
@@ -993,6 +989,7 @@ jobs:
   # branch so the external dashboard can poll it. Runs on a hosted runner (the
   # GPU box has no gh/git tooling). Contract: docs/qualification-feed.md.
   publish-qualification:
+    if: ${{ false }}  # REHEARSAL BRANCH - no data-branch writes
     needs: qualify
     if: always() && (needs.qualify.result == 'success' || needs.qualify.result == 'failure')
     runs-on: ubuntu-22.04
@@ -1091,6 +1088,7 @@ jobs:
         echo "  https://raw.githubusercontent.com/${{ github.repository }}/${BRANCH}/qualification/index.json"
 
   create-release:
+    if: ${{ false }}  # REHEARSAL BRANCH - never mint a release
     needs: [prepare-matrix, build-ubuntu, qualify]
     runs-on: ubuntu-22.04
     permissions:
