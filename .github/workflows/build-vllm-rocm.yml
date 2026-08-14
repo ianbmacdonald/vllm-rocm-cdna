@@ -465,13 +465,18 @@ jobs:
             ROCM_STAMP=$(echo "$VLLM_VER" | grep -oE 'rocm[0-9.]+a[0-9]+' | head -1)
             echo "omni: pinning base to $VLLM_VER (stamp $ROCM_STAMP)"
           fi
-          # upstream vLLM 0.25.x pins torch 2.12.0 (the wheel itself strips it);
-          # bump TORCH_VER here when vLLM bumps its torch requirement — and
-          # TV_VER with it: torchvision pairs strictly with torch (used by the
-          # repair step below) or torchvision::nms fails to register and
-          # `import vllm` dies. The omni base (0.25.x) shares this ABI.
-          TORCH_VER=2.12.0
-          TV_VER=0.27.0
+          # torch pairs per NIGHTLY LINE, not globally: RDNA rides vLLM 0.25.x
+          # which pins torch 2.12.0, but the CDNA line is frozen at vLLM
+          # 0.23.1 (2.11-era ABI) — pairing it with 2.12 leaves unresolved
+          # torch::Library symbols in the compiled extension (rehearsal run
+          # 31761304121, T0.2). TV_VER moves strictly with TORCH_VER or
+          # torchvision::nms fails to register and `import vllm` dies. The
+          # omni base (0.25.x) shares the RDNA ABI. All three wheels exist at
+          # the CDNA stamp (verified against whl-multi-arch a20260721).
+          case "$NIGHTLY_SET" in
+            device-all-cdna) TORCH_VER=2.11.0; TV_VER=0.26.0 ;;
+            *)               TORCH_VER=2.12.0; TV_VER=0.27.0 ;;
+          esac
           echo "nightly: vLLM==$VLLM_VER"
           echo "nightly: torch=${TORCH_VER}+${ROCM_STAMP}[device-${DEV}]"
           # 2. Matched torch + ROCm runtime libs + Triton + per-gfx kernels,
